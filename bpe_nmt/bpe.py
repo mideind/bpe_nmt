@@ -14,13 +14,22 @@ from tensor2tensor.data_generators.text_encoder import (
     strip_ids,
 )
 
+try:
+    from icecream import ic
+    ic.configureOutput(includeContext=True)
+except ImportError:  # Graceful fallback if IceCream isn't installed.
+    ic = lambda *a: None if not a else (a[0] if len(a) == 1 else a)  # noqa
+
 
 PAD = "<pad>"
 EOS = "<EOS>"
+UNK = "<UNK>"
 RESERVED_TOKENS = [PAD, EOS]
+# RESERVED_TOKENS = [PAD, EOS, UNK]
 NUM_RESERVED_TOKENS = len(RESERVED_TOKENS)
 PAD_ID = RESERVED_TOKENS.index(PAD)  # Normally 0
 EOS_ID = RESERVED_TOKENS.index(EOS)  # Normally 1
+# UNK_ID = RESERVED_TOKENS.index(UNK)  # Normally 2
 
 
 PUA_OFFSET = 0x100000  # Unicode Private Usage Area
@@ -37,11 +46,43 @@ WHITESPACE = re.compile(r"\s+")
 MIN_COUNT = 5
 
 
+PathSegment = collections.namedtuple("PathSegment", ["length", "start", "symbol"])
+
+
 def encode_capitalization(token):
     uppers = set(c for c in token if c.isupper())
     for c in uppers:
         token = token.replace(c, UP_ARROW + c.lower())
     return token
+
+
+def atomize_token(token):
+    return list(token)
+
+
+def byte_to_hex_pair(num):
+    assert 0 <= num <= 255
+    string = str(hex(int(num)))[2:]
+    if len(string) < 2:
+        return "0" + string
+    return string
+
+
+def atomize_token_to_hex(token):
+    hex_pairs = [byte_to_hex_pair(i) for i in bytes(token, "utf-8")]
+    return hex_pairs
+
+
+def deatomize_hex(token):
+    assert len(token) % 2 == 0
+    # TODO: This can fail
+    result = bytearray()
+    for pair in list(pairwise(token))[::2]:
+        result.append(int("".join(pair), 16))
+    try:
+        return result.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return str(token)
 
 
 def decode_capitalization(token):
@@ -68,6 +109,7 @@ def remove_meta_symbols(token):
 
 
 class BPEEncoder:
+
     def __init__(
         self,
         alphabet,
@@ -75,10 +117,10 @@ class BPEEncoder:
         symbols,
         separate_case=True,
         num_reserved_ids=NUM_RESERVED_TOKENS,
-        omit_eow=False,
+        use_eow=True,
     ):
         self._separate_case = separate_case
-        self.omit_eow = omit_eow
+        self.use_eow = use_eow
         self._num_reserved_ids = num_reserved_ids
         self.alphabet = alphabet
         self.merge_table = merge_table
@@ -92,12 +134,11 @@ class BPEEncoder:
     def maybe_add_meta_symbols(self, token, eow=EOW):
         if self.separate_case:
             token = encode_capitalization(token)
-        if not self.omit_eow:
+        if self.use_eow:
             token = token + eow
         return token
 
     def encode(self, text, greedy=True):
-        # TODO: implement dropout
         tokens = [
             self.maybe_add_meta_symbols(tok) for tok in t2t_tokenizer.encode(text)
         ]
@@ -128,19 +169,26 @@ class BPEEncoder:
                 # If there is no possible encoding of the escaped token then one of the
                 # characters in the token is not in the alphabet. This should be
                 # impossible and would be indicative of a bug.
-                assert False, "Token substring not found in subtoken vocabulary."
+                # # TODO: Use param to allow UNK token
+                assert (
+                    False
+                ), "Token substring not found in subtoken vocabulary: {}".format(
+                    escaped_token[start:]
+                )
         return [self._subtoken_string_to_id[substr] for substr in ret]
 
-    def _encode_token_optimal(self, escaped_token, verbose=False):
+    def _encode_token_optimal(self, token, verbose=False):
         """
-        nicest implementation uses a trie (prefix tree)
+        Encode token in a manner that uses the least amount of subtokens.
+        A nicer implementation could use a prefix tree to construct the graph
 
         graph[i] points to the nearest node which is on the shortest path from graph[i] to graph[0]
         via the BPE vocabulary
 
-        graph[i] contains the longest substring in escaped_token starting at i that is in the BPE
+        graph[i] contains the longest substring in token starting at i that is in the BPE
         vocabulary.
 
+        Example:
         vocabulary:
           a b c d e ab bc de fg bcde
         tokenized text:
@@ -182,43 +230,47 @@ class BPEEncoder:
             if verbose
             else (lambda *ar, **kw: None)
         )
-        Path = collections.namedtuple(
-            "Path", ["length", "start", "symbol"]  # start in path, not token
-        )
-        if not escaped_token:
+        if not token:
             return []
         start = 0
         end = 1
-        path = [Path(0, 0, "")] + [
-            Path(pos + 1, pos, escaped_token[pos]) for pos in range(len(escaped_token))
+        graph = [PathSegment(0, 0, "")] + [
+            PathSegment(pos + 1, pos, token[pos])
+            for pos in range(len(token))
         ]
 
-        _pprint(path)
-        max_len = len(escaped_token)
+        _pprint(graph)
+        max_len = len(token)
         _print("Entering path loop")
         while start < max_len:
-            substring = escaped_token[start:end]
-            if substring in self._subtoken_string_to_id:
-                end_pos = start + len(substring)
-                if path[start].length < path[end_pos].length:
-                    prev = path[end_pos]
-                    path[end_pos] = Path(path[start].length + 1, start, substring)
-                    _print(prev, " ", path[end_pos])
+            subseq = token[start:end]
+            subseq_len = len(subseq)
+            if isinstance(subseq, tuple):
+                subseq = "".join(subseq)
+            if subseq in self._subtoken_string_to_id:
+                # Using new path is not worse than previous path, default to new path
+                end_pos = start + subseq_len
+                if graph[start].length < graph[end_pos].length:
+                    prev = graph[end_pos]
+                    graph[end_pos] = PathSegment(
+                        graph[start].length + 1, start, subseq
+                    )
+                    _print(prev, " ", graph[end_pos])
             end += 1
             if (end - start) > self._max_subtoken_len:
                 start += 1
                 end = start + 1
         _print("Exited path loop")
-        _pprint(path)
+        _pprint(graph)
         subtokens = []
-        pointer = path[-1]
+        pointer = graph[-1]
         _print("Constructing shortest path")
         last = pointer
         while pointer.symbol:
             last = pointer.start
             _print(pointer.start)
             subtokens.append(pointer.symbol)
-            pointer = path[pointer.start]
+            pointer = graph[pointer.start]
             if last == pointer.start:
                 _print("exiting")
                 break
@@ -239,7 +291,7 @@ class BPEEncoder:
         return ret
 
     def _encode_token_with_dropout(self, token, dropout):
-        atoms = list(token)
+        atoms = self._atomize(token)
         table = {pair: idx for (idx, pair) in enumerate(self.merge_table)}
         while True:
             best_idx = len(table)
@@ -269,7 +321,7 @@ class BPEEncoder:
         return t2t_tokenizer.decode([token for token in substrings if token])
 
     def decode_list(self, ids):
-        pass
+        return [self.all_symbols[idx] for idx in ids]
 
     @property
     def vocab_size(self):
@@ -281,7 +333,7 @@ class BPEEncoder:
 
     @classmethod
     def build_from_generator(
-        cls, generator, max_size, separate_case=True, verbose=False, omit_eow=False
+        cls, generator, max_size, separate_case=True, verbose=False, use_eow=True
     ):
         token_counts = collections.defaultdict(int)
         for line in generator:
@@ -292,15 +344,15 @@ class BPEEncoder:
             max_size,
             separate_case=separate_case,
             verbose=verbose,
-            omit_eow=omit_eow,
+            use_eow=use_eow,
         )
 
     @classmethod
     def build_from_token_counts(
-        cls, token_counts, max_size, separate_case=True, verbose=False, omit_eow=False
+        cls, token_counts, max_size, separate_case=True, verbose=False, use_eow=True
     ):
         token_counts_with_eow = collections.defaultdict(int)
-        maybe_append_eow = (lambda s: s) if omit_eow else (lambda s: s + EOW)
+        maybe_append_eow = (lambda s: s + EOW) if use_eow else (lambda s: s)
         maybe_encode_capitalization = (
             (lambda s: s) if not separate_case else encode_capitalization
         )
@@ -312,7 +364,7 @@ class BPEEncoder:
             token_counts_with_eow, max_size, verbose=verbose
         )
         return cls(
-            alphabet, merge_table, symbols, separate_case=True, omit_eow=omit_eow
+            alphabet, merge_table, symbols, separate_case=True, use_eow=use_eow
         )
 
     def store_to_file(self, path):
@@ -334,6 +386,114 @@ class BPEEncoder:
                 obj["alphabet"], merge_table, obj["symbols"], obj["separate_case"]
             )
             return enc
+
+    @classmethod
+    def _atomize(cls, token):
+        return atomize_token(token)
+
+
+class ByteBPEEncoder(BPEEncoder):
+
+    def __init__(
+        self,
+        alphabet,
+        merge_table,
+        symbols,
+        separate_case=True,
+        num_reserved_ids=NUM_RESERVED_TOKENS,
+        use_eow=True,
+    ):
+        self._separate_case = separate_case
+        self.use_eow = use_eow
+        self._num_reserved_ids = num_reserved_ids
+        self.alphabet = alphabet
+        self.merge_table = merge_table
+        self.symbols = symbols
+        self.all_symbols = RESERVED_TOKENS + symbols
+        self._subtoken_string_to_id = {
+            sym: idx for (idx, sym) in enumerate(self.all_symbols)
+        }
+        self._max_subtoken_len = max(len(sym) for sym in self.symbols)
+
+
+    @classmethod
+    def build_from_token_counts(
+        cls, token_counts, max_size, separate_case=True, verbose=False, use_eow=True
+    ):
+        token_counts_with_eow = collections.defaultdict(int)
+        maybe_append_eow = (lambda s: s + EOW) if use_eow else (lambda s: s)
+        maybe_encode_capitalization = (
+            (lambda s: s) if not separate_case else encode_capitalization
+        )
+        for (token, count) in token_counts.items():
+            token = maybe_encode_capitalization(token)
+            token = maybe_append_eow(token)
+            token_counts_with_eow[token] = count
+
+        # ensure total coverage
+        for num in range(256):
+            hex_pair = byte_to_hex_pair(num)
+            token_counts_with_eow[hex_pair] += 1
+
+        alphabet, merge_table, symbols = build_from_token_counts(
+            token_counts_with_eow, max_size, verbose=verbose, atomize=cls._atomize
+        )
+        return cls(
+            alphabet, merge_table, symbols, separate_case=True, use_eow=use_eow
+        )
+
+    def _encode_token_greedy(self, token):
+        token = "".join(self._atomize(token))
+        return super(ByteBPEEncoder, self)._encode_token_greedy(token)
+
+    def _encode_token_optimal(self, token, verbose=False):
+        token = tuple(self._atomize(token))
+
+        # import pdb; pdb.set_trace()
+        return super(ByteBPEEncoder, self)._encode_token_optimal(token)
+
+    def decode(self, ids, strip_extraneous=False):
+        atoms = [self.all_symbols[idx] for idx in ids]
+
+        array = bytearray()
+        for atom in atoms:
+            for pair in list(pairwise(atom))[::2]:
+                array.append(int("".join(pair), 16))
+        decoded_atoms = [atom for atom in array.decode("utf-8").split(EOW) if atom]
+
+        # EOW_HEX = "e29083"
+        # ex_array = [bytearray()]
+        # current = ex_array[0]
+        # decoded_atoms = []
+        # for atom in atoms:
+        #     for pair in list(pairwise(atom))[::2]:
+        #         current.append(int("".join(pair), 16))
+        #     if EOW_HEX in atom:
+        #         decoded_atoms.append(current.decode("utf-8"))
+        #         current = bytearray()
+        #         ex_array.append(current)
+
+        atoms = [remove_meta_symbols(atom) for atom in decoded_atoms]
+        res = t2t_tokenizer.decode(atoms)
+        return res
+
+    def decode_list_human(self, ids):
+        atoms = [self.all_symbols[idx] for idx in ids]
+        decoded_atoms = []
+        for atom in atoms:
+            current = bytearray()
+            for pair in list(pairwise(atom))[::2]:
+                current.append(int("".join(pair), 16))
+            try:
+                string = current.decode("utf-8")
+                decoded_atoms.append(string)
+            except UnicodeDecodeError as e:
+                decoded_atoms.append("<0x{}>".format(atom))
+        return decoded_atoms
+
+    @classmethod
+    def _atomize(cls, token):
+        return atomize_token_to_hex(token)
 
 
 def merge_pair_in_vocab(vocab_old, pair, symbol_delimiter=" "):
@@ -366,7 +526,11 @@ def compute_pair_counts(vocab, symbol_delimiter=" "):
 
 
 def build_from_token_counts(
-    token_counts, max_size, verbose=False, symbol_delimiter=SYMBOL_DELIMITER
+    token_counts,
+    max_size,
+    verbose=False,
+    symbol_delimiter=SYMBOL_DELIMITER,
+    atomize=atomize_token,
 ):
     """Description
     Args:
@@ -380,8 +544,9 @@ def build_from_token_counts(
     alphabet = set()
     atomized_vocab = dict()
     for (token, count) in token_counts.items():
-        alphabet.update(token)
-        atomized_token = symbol_delimiter.join(list(token))
+        atoms = atomize(token)
+        alphabet.update(atoms)
+        atomized_token = symbol_delimiter.join(atoms)
         atomized_vocab[atomized_token] = count
     del token_counts
 
@@ -436,6 +601,7 @@ def line_gen(path):
 def roundrobin(*iterables):
     "roundrobin('ABC', 'D', 'EF') --> A D E B F C"
     # Recipe credited to George Sakkis
+    # Recipe from the online Python documentation
     pending = len(iterables)
     nexts = itertools.cycle(iter(it).next for it in iterables)
     while pending:
@@ -445,3 +611,10 @@ def roundrobin(*iterables):
         except StopIteration:
             pending -= 1
             nexts = itertools.cycle(itertools.islice(nexts, pending))
+
+
+def pairwise(iterable):
+    # Recipe from the online Python documentation
+    a, b = itertools.tee(iterable)
+    next(b, None)
+    return zip(a, b)

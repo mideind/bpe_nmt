@@ -1,7 +1,6 @@
 import itertools
 
-from bpe import BPEEncoder, EOW, RESERVED_TOKENS, line_gen, roundrobin
-
+from bpe_nmt.bpe import BPEEncoder, EOW, RESERVED_TOKENS, line_gen, roundrobin
 from tensor2tensor.data_generators import tokenizer as t2t_tokenizer
 
 
@@ -22,7 +21,7 @@ def test_build_from_frequencies():
     alphabet = ["a", "b", "c", "d"]
     merges = [("a", "b"), ("c", "d")]
 
-    enc = BPEEncoder.build_from_token_counts(token_counts, 6, omit_eow=True)
+    enc = BPEEncoder.build_from_token_counts(token_counts, 6, use_eow=False)
     assert enc.alphabet == alphabet
     assert enc.merge_table == merges
 
@@ -50,9 +49,9 @@ def test_bpe_encoder_build():
     2*'a b _'  'a b c _'  'b c d _'  'c d _'
     """
     token_counts = dict(ab=2, abc=1, bcd=1, cd=1)
-    enc = BPEEncoder.build_from_token_counts(token_counts, 5, False)
+    enc = BPEEncoder.build_from_token_counts(token_counts, 5, separate_case=False)
     assert enc.symbols == ["a", "b", "c", "d", EOW]
-    enc = BPEEncoder.build_from_token_counts(token_counts, 7, False)
+    enc = BPEEncoder.build_from_token_counts(token_counts, 7, separate_case=False)
     assert enc.symbols == ["a", "b", "c", "d", EOW, "ab", "ab" + EOW]
     assert enc.all_symbols == RESERVED_TOKENS + [
         "a",
@@ -92,7 +91,7 @@ def test_bpe_encoder_optimal():
     """
     corpus = "ab ab ab ab ab ab bc de bcde bcde"
     text = "abcde"
-    enc = BPEEncoder.build_from_generator([corpus], 20, False, omit_eow=True)
+    enc = BPEEncoder.build_from_generator([corpus], 20, False, use_eow=False)
 
     greedy_ids = enc.encode(text)
     greedy_symbols = [enc.decode([token_id]) for token_id in greedy_ids]
@@ -106,7 +105,7 @@ def test_bpe_encoder_optimal():
 def test_dropout():
     corpus = "abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh"
     text = "abcdefgh"
-    enc = BPEEncoder.build_from_generator([corpus], 30, False, omit_eow=True)
+    enc = BPEEncoder.build_from_generator([corpus], 30, False, use_eow=False)
     encodings = set()
     for _ in range(50):
         dropout_ids = enc.encode_with_dropout(text, dropout=0.2)
