@@ -4,6 +4,7 @@ import os
 import json
 import random
 from pprint import pprint
+import itertools
 
 from tensor2tensor.data_generators import tokenizer as t2t_tokenizer
 from tensor2tensor.data_generators.text_encoder import (
@@ -16,6 +17,7 @@ from tensor2tensor.data_generators.text_encoder import (
 
 try:
     from icecream import ic
+
     ic.configureOutput(includeContext=True)
 except ImportError:  # Graceful fallback if IceCream isn't installed.
     ic = lambda *a: None if not a else (a[0] if len(a) == 1 else a)  # noqa
@@ -109,7 +111,6 @@ def remove_meta_symbols(token):
 
 
 class BPEEncoder:
-
     def __init__(
         self,
         alphabet,
@@ -235,8 +236,7 @@ class BPEEncoder:
         start = 0
         end = 1
         graph = [PathSegment(0, 0, "")] + [
-            PathSegment(pos + 1, pos, token[pos])
-            for pos in range(len(token))
+            PathSegment(pos + 1, pos, token[pos]) for pos in range(len(token))
         ]
 
         _pprint(graph)
@@ -252,9 +252,7 @@ class BPEEncoder:
                 end_pos = start + subseq_len
                 if graph[start].length < graph[end_pos].length:
                     prev = graph[end_pos]
-                    graph[end_pos] = PathSegment(
-                        graph[start].length + 1, start, subseq
-                    )
+                    graph[end_pos] = PathSegment(graph[start].length + 1, start, subseq)
                     _print(prev, " ", graph[end_pos])
             end += 1
             if (end - start) > self._max_subtoken_len:
@@ -333,12 +331,29 @@ class BPEEncoder:
 
     @classmethod
     def build_from_generator(
-        cls, generator, max_size, separate_case=True, verbose=False, use_eow=True
+        cls,
+        generator,
+        max_size,
+        separate_case=True,
+        verbose=False,
+        use_eow=True,
+        max_lines=100000,
+        continue_for_alphabet=True,
     ):
         token_counts = collections.defaultdict(int)
-        for line in generator:
+        rest = []
+        if max_lines is not None:
+            rest = iter(generator)
+            generator = itertools.islice(generator, max_lines)
+        for idx, line in enumerate(generator):
             for token in t2t_tokenizer.encode(line):
                 token_counts[token] += 1
+        if max_lines is not None and continue_for_alphabet:
+            alphabet_rest = set()
+            for line in rest:
+                alphabet_rest.update(line)
+            alphabet_rest = "".join(alphabet_rest)
+            token_counts[alphabet_rest] += 1
         return cls.build_from_token_counts(
             token_counts,
             max_size,
@@ -363,9 +378,7 @@ class BPEEncoder:
         alphabet, merge_table, symbols = build_from_token_counts(
             token_counts_with_eow, max_size, verbose=verbose
         )
-        return cls(
-            alphabet, merge_table, symbols, separate_case=True, use_eow=use_eow
-        )
+        return cls(alphabet, merge_table, symbols, separate_case=True, use_eow=use_eow)
 
     def store_to_file(self, path):
         with open(path, "w", encoding="utf-8") as file_handle:
@@ -393,7 +406,6 @@ class BPEEncoder:
 
 
 class ByteBPEEncoder(BPEEncoder):
-
     def __init__(
         self,
         alphabet,
@@ -414,7 +426,6 @@ class ByteBPEEncoder(BPEEncoder):
             sym: idx for (idx, sym) in enumerate(self.all_symbols)
         }
         self._max_subtoken_len = max(len(sym) for sym in self.symbols)
-
 
     @classmethod
     def build_from_token_counts(
@@ -438,9 +449,7 @@ class ByteBPEEncoder(BPEEncoder):
         alphabet, merge_table, symbols = build_from_token_counts(
             token_counts_with_eow, max_size, verbose=verbose, atomize=cls._atomize
         )
-        return cls(
-            alphabet, merge_table, symbols, separate_case=True, use_eow=use_eow
-        )
+        return cls(alphabet, merge_table, symbols, separate_case=True, use_eow=use_eow)
 
     def _encode_token_greedy(self, token):
         token = "".join(self._atomize(token))
