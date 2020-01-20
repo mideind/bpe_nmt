@@ -15,12 +15,19 @@ from tensor2tensor.data_generators.text_encoder import (
     strip_ids,
 )
 
+import numpy as np
+
 try:
     from icecream import ic
 
     ic.configureOutput(includeContext=True)
 except ImportError:  # Graceful fallback if IceCream isn't installed.
     ic = lambda *a: None if not a else (a[0] if len(a) == 1 else a)  # noqa
+
+try:
+    from tqdm import tqdm
+except ImportError:  # Graceful fallback
+    tqdm = lambda *a: None if not a else a[0]
 
 
 PAD = "<pad>"
@@ -79,7 +86,7 @@ def deatomize_hex(token):
     assert len(token) % 2 == 0
     # TODO: This can fail
     result = bytearray()
-    for pair in list(pairwise(token))[::2]:
+    for pair in list(pairwise_nonverlapping(token)):
         result.append(int("".join(pair), 16))
     try:
         return result.decode("utf-8")
@@ -110,6 +117,14 @@ def remove_meta_symbols(token):
     return token
 
 
+def enforce_alphabet(text, alphabet, substitute=""):
+    diff = set(text).difference(alphabet)
+    if diff:
+        for c in diff:
+            text = text.replace(c, substitute)
+    return text
+
+
 class BPEEncoder:
     def __init__(
         self,
@@ -119,12 +134,16 @@ class BPEEncoder:
         separate_case=True,
         num_reserved_ids=NUM_RESERVED_TOKENS,
         use_eow=True,
+        ignore_ooa=True,
     ):
         self._separate_case = separate_case
         self.use_eow = use_eow
         self._num_reserved_ids = num_reserved_ids
         self.alphabet = alphabet
+        self._alphabet_set = set(alphabet)
+        self._ignore_ooa = ignore_ooa
         self.merge_table = merge_table
+        self.merge_dict = {pair: idx for (idx, pair) in enumerate(merge_table)}
         self.symbols = symbols
         self.all_symbols = RESERVED_TOKENS + symbols
         self._subtoken_string_to_id = {
@@ -140,9 +159,12 @@ class BPEEncoder:
         return token
 
     def encode(self, text, greedy=True):
-        tokens = [
-            self.maybe_add_meta_symbols(tok) for tok in t2t_tokenizer.encode(text)
-        ]
+        tokens = []
+        for token in t2t_tokenizer.encode(text):
+            if self._ignore_ooa:
+                token = enforce_alphabet(token, self._alphabet_set)
+            token = self.maybe_add_meta_symbols(token)
+            tokens.append(token)
         return self._encode_tokens(tokens, greedy=greedy)
 
     def _encode_tokens(self, tokens, greedy=True):
@@ -171,11 +193,10 @@ class BPEEncoder:
                 # characters in the token is not in the alphabet. This should be
                 # impossible and would be indicative of a bug.
                 # # TODO: Use param to allow UNK token
-                assert (
-                    False
-                ), "Token substring not found in subtoken vocabulary: {}".format(
-                    escaped_token[start:]
-                )
+                assert False, (
+                    "Could not encode substring because some characters were not"
+                    " found in alphabet: '{}'"
+                ).format(escaped_token[start:])
         return [self._subtoken_string_to_id[substr] for substr in ret]
 
     def _encode_token_optimal(self, token, verbose=False):
@@ -280,35 +301,33 @@ class BPEEncoder:
         return ids
 
     def encode_with_dropout(self, text, dropout):
-        tokens = [
-            self.maybe_add_meta_symbols(tok) for tok in t2t_tokenizer.encode(text)
-        ]
         ret = []
-        for token in tokens:
+        for token in t2t_tokenizer.encode(text):
+            if self._ignore_ooa:
+                token = enforce_alphabet(token, self._alphabet_set)
+            token = self.maybe_add_meta_symbols(token)
             ret.extend(self._encode_token_with_dropout(token, dropout))
         return ret
 
     def _encode_token_with_dropout(self, token, dropout):
         atoms = self._atomize(token)
-        table = {pair: idx for (idx, pair) in enumerate(self.merge_table)}
         while True:
-            best_idx = len(table)
-            for i in range(len(atoms) - 1):
-                pair = (atoms[i], atoms[i + 1])
-                if pair in table:
-                    if random.random() < dropout:
-                        continue
-                    best_idx = min(table[pair], best_idx)
-            if best_idx >= len(table):
-                break
 
-            pair = self.merge_table[best_idx]
-            merged_pair = "".join(pair)
+            pairs = list(pairwise_overlapping(atoms))
             idxs = [
-                i for i in range(len(atoms) - 1) if (atoms[i], atoms[i + 1]) == pair
+                self.merge_dict[pair] for pair in pairs if pair in self.merge_dict
             ]
-            for idx in reversed(idxs):
-                atoms[idx : idx + 2] = [merged_pair]
+            probs = np.random.random(len(idxs))
+            keep = list(itertools.compress(idxs, probs > dropout))
+            if not keep:
+                break
+            best_idx = min(keep)
+            best_pair = self.merge_table[best_idx]
+            merge_offsets = [offset for (offset, pair) in enumerate(pairs) if pair == best_pair]
+            merged_pair = "".join(best_pair)
+            for offset in reversed(merge_offsets):
+                atoms[offset: offset+2] = [merged_pair]
+
         ret = [self._subtoken_string_to_id[idx] for idx in atoms]
         return ret
 
@@ -414,12 +433,16 @@ class ByteBPEEncoder(BPEEncoder):
         separate_case=True,
         num_reserved_ids=NUM_RESERVED_TOKENS,
         use_eow=True,
+        ignore_ooa=False,
     ):
         self._separate_case = separate_case
         self.use_eow = use_eow
         self._num_reserved_ids = num_reserved_ids
         self.alphabet = alphabet
+        self._ignore_ooa = ignore_ooa
+        self._alphabet_set = set(alphabet)
         self.merge_table = merge_table
+        self.merge_dict = {pair: idx for (idx, pair) in enumerate(self.merge_table)}
         self.symbols = symbols
         self.all_symbols = RESERVED_TOKENS + symbols
         self._subtoken_string_to_id = {
@@ -458,7 +481,6 @@ class ByteBPEEncoder(BPEEncoder):
     def _encode_token_optimal(self, token, verbose=False):
         token = tuple(self._atomize(token))
 
-        # import pdb; pdb.set_trace()
         return super(ByteBPEEncoder, self)._encode_token_optimal(token)
 
     def decode(self, ids, strip_extraneous=False):
@@ -466,8 +488,10 @@ class ByteBPEEncoder(BPEEncoder):
 
         array = bytearray()
         for atom in atoms:
-            for pair in list(pairwise(atom))[::2]:
+            for pair in list(pairwise_nonverlapping(atom)):
                 array.append(int("".join(pair), 16))
+
+        # # TODO: handle possible UnicodeDecodeError
         decoded_atoms = [atom for atom in array.decode("utf-8").split(EOW) if atom]
 
         # EOW_HEX = "e29083"
@@ -491,7 +515,7 @@ class ByteBPEEncoder(BPEEncoder):
         decoded_atoms = []
         for atom in atoms:
             current = bytearray()
-            for pair in list(pairwise(atom))[::2]:
+            for pair in list(pairwise_nonverlapping(atom)):
                 current.append(int("".join(pair), 16))
             try:
                 string = current.decode("utf-8")
@@ -566,7 +590,7 @@ def build_from_token_counts(
         raise ValueError("Invalid vocab size, must be at least enough for alphabet")
 
     merge_table = []
-    for iter_idx in range(num_merges):
+    for iter_idx in tqdm(range(num_merges)):
         _print("Iteration {:>5d}".format(iter_idx))
         pair_counts = compute_pair_counts(
             atomized_vocab, symbol_delimiter=SYMBOL_DELIMITER
@@ -622,8 +646,17 @@ def roundrobin(*iterables):
             nexts = itertools.cycle(itertools.islice(nexts, pending))
 
 
-def pairwise(iterable):
+def pairwise_overlapping(iterable):
     # Recipe from the online Python documentation
     a, b = itertools.tee(iterable)
     next(b, None)
     return zip(a, b)
+
+
+def pairwise_nonverlapping(iterable):
+    # Recipe from the online Python documentation
+    for (idx, item) in enumerate(pairwise_overlapping(iterable)):
+        if idx % 2 == 0:
+            yield item
+        else:
+            continue

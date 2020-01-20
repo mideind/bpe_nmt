@@ -1,6 +1,6 @@
 import itertools
 
-from bpe_nmt.bpe import ByteBPEEncoder, EOW, RESERVED_TOKENS, line_gen, roundrobin, pairwise
+from bpe_nmt.bpe import ByteBPEEncoder, EOW, RESERVED_TOKENS, line_gen
 from tensor2tensor.data_generators import tokenizer as t2t_tokenizer
 
 try:
@@ -12,7 +12,7 @@ except ImportError:  # Graceful fallback if IceCream isn't installed.
 
 def test_bpe_encoder_build():
     corpus = (
-        " þrá þráum þráð"
+        "þrá þráum þráð"
         " þrái þráð þrái þræði"
         " þráir þráðir þráir þræðir"
         " þráir þráði þrái þræði"
@@ -46,17 +46,20 @@ def test_large_greedy():
     text = "Upplýsingar sem eiga að koma fram í áliti Matvæla öryggisstofnunarinnar"
     greedy_ids = enc.encode(text)
     decoded = enc.decode(greedy_ids)
+    print(text)
+    print(decoded)
     assert text == decoded
 
 
 def test_large_dropout():
     enc = ByteBPEEncoder.load_from_file("tests/vocab_bbpe_large.json")
     text = "Upplýsingar sem eiga að koma fram í áliti Matvæla öryggisstofnunarinnar"
-    ids = enc.encode_with_dropout(text, 0.2)
-    decoded = enc.decode(ids)
+    ids = enc.encode_with_dropout(text, 0.1)
     print(ids)
     print(enc.decode_list(ids))
+    print(":".join(enc.decode_list(ids)))
     ic(enc.decode_list_human(ids))
+    decoded = enc.decode(ids)
     print(decoded)
     assert text == decoded
 
