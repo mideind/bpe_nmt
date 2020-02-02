@@ -170,3 +170,12 @@ def debug_bpe_large_02():
             print()
 
     print(total_matches / max_line_count)
+
+
+def test_round_large_ooa():
+    enc = BPEEncoder.load_from_file("tests/vocab_large.json")
+    text = "I have done a test, but no result has appeared on the Display."
+    ids = enc.encode(text)
+    decoded = enc.decode(ids)
+    assert text == decoded
+

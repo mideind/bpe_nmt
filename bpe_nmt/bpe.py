@@ -117,8 +117,11 @@ def remove_meta_symbols(token):
     return token
 
 
-def enforce_alphabet(text, alphabet, substitute=""):
-    diff = set(text).difference(alphabet)
+def enforce_alphabet(text, alphabet, substitute="", lower=True):
+    text_xformed = text
+    if lower:
+        text_xformed = text.lower()
+    diff = set(text_xformed).difference(alphabet)
     if diff:
         for c in diff:
             text = text.replace(c, substitute)
@@ -161,9 +164,11 @@ class BPEEncoder:
     def encode(self, text, greedy=True):
         tokens = []
         for token in t2t_tokenizer.encode(text):
-            if self._ignore_ooa:
-                token = enforce_alphabet(token, self._alphabet_set)
             token = self.maybe_add_meta_symbols(token)
+            if self._ignore_ooa:
+                token = enforce_alphabet(
+                    token, self._alphabet_set, lower=self.separate_case
+                )
             tokens.append(token)
         return self._encode_tokens(tokens, greedy=greedy)
 
@@ -314,19 +319,19 @@ class BPEEncoder:
         while True:
 
             pairs = list(pairwise_overlapping(atoms))
-            idxs = [
-                self.merge_dict[pair] for pair in pairs if pair in self.merge_dict
-            ]
+            idxs = [self.merge_dict[pair] for pair in pairs if pair in self.merge_dict]
             probs = np.random.random(len(idxs))
             keep = list(itertools.compress(idxs, probs > dropout))
             if not keep:
                 break
             best_idx = min(keep)
             best_pair = self.merge_table[best_idx]
-            merge_offsets = [offset for (offset, pair) in enumerate(pairs) if pair == best_pair]
+            merge_offsets = [
+                offset for (offset, pair) in enumerate(pairs) if pair == best_pair
+            ]
             merged_pair = "".join(best_pair)
             for offset in reversed(merge_offsets):
-                atoms[offset: offset+2] = [merged_pair]
+                atoms[offset : offset + 2] = [merged_pair]
 
         ret = [self._subtoken_string_to_id[idx] for idx in atoms]
         return ret
@@ -334,8 +339,17 @@ class BPEEncoder:
     def decode(self, ids, strip_extraneous=False):
         if strip_extraneous:
             ids = strip_ids(ids, list(range(self._num_reserved_ids or 0)))
-        substrings = [remove_meta_symbols(self.all_symbols[idx]) for idx in ids]
-        return t2t_tokenizer.decode([token for token in substrings if token])
+        substrings = [self.all_symbols[idx] for idx in ids]
+        concat = "".join(substrings)
+        split = concat.split(EOW)
+        tokens = []
+        for subtoken in split:
+            if subtoken:
+                unescaped_token = remove_meta_symbols(subtoken)
+                if unescaped_token:
+                    tokens.append(unescaped_token)
+        detokenized = t2t_tokenizer.decode(tokens)
+        return detokenized
 
     def decode_list(self, ids):
         return [self.all_symbols[idx] for idx in ids]
